@@ -294,12 +294,12 @@ class GuidedDriftingField:
         else:
             negative = generated
 
-        # Compute loss
+        # Compute loss (new API only takes generated and positive)
+        # Note: For CFG, we could extend to use negative samples differently
+        # but for now, the official implementation just uses gen and pos
         loss, metrics = self.drift_loss(
             generated=generated,
             positive=positive,
-            negative=negative,
-            update_stats=update_stats,
         )
 
         metrics["cfg_alpha_mean"] = alpha_mean

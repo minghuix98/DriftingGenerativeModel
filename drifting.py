@@ -1,462 +1,346 @@
 """Drifting Field Computation for Generative Modeling.
 
-Implements the core drifting field computation from the paper:
+Official implementation matching the Colab notebook from:
 "Generative Modeling via Drifting" (arXiv:2602.04770)
 
-The drifting field V_{p,q}(x) is computed as:
-    V_{p,q}(x) = V^+_p(x) - V^-_q(x)
-
-where:
-    V^+_p(x) = (1/Z_p) * E_p[k(x,y^+) * (y^+ - x)]  (attraction to data)
-    V^-_q(x) = (1/Z_q) * E_q[k(x,y^-) * (y^- - x)]  (repulsion from generated)
-
-The kernel is: k(x,y) = exp(-||x-y|| / tau)
+The drifting field V is computed using batch-normalized kernel with:
+1. Concatenate gen and pos samples
+2. exp(-dist/temp) kernel
+3. Bidirectional normalization: sqrt(row_sum * col_sum)
+4. Cross-weighting for attraction and repulsion
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def compute_pairwise_distances(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    squared: bool = False,
+def compute_drift(
+    gen: torch.Tensor,
+    pos: torch.Tensor,
+    temp: float = 0.05,
+    normalize_dist: bool = True,
 ) -> torch.Tensor:
-    """Compute pairwise L2 distances between two sets of vectors.
+    """
+    Compute drift field V with attention-based kernel.
+
+    This is the EXACT implementation from the official Colab notebook,
+    with optional distance normalization for high-dimensional stability.
 
     Args:
-        x: Tensor of shape (N, D)
-        y: Tensor of shape (M, D)
-        squared: If True, return squared distances
+        gen: Generated samples [G, D]
+        pos: Data samples [P, D]
+        temp: Temperature for kernel
+        normalize_dist: If True, normalize distances by sqrt(D) for high-dim data
 
     Returns:
-        Distances of shape (N, M)
+        V: Drift vectors [G, D]
     """
-    # ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x @ y.T
-    x_norm = (x**2).sum(dim=-1, keepdim=True)  # (N, 1)
-    y_norm = (y**2).sum(dim=-1, keepdim=True)  # (M, 1)
-    dist_sq = x_norm + y_norm.T - 2 * x @ y.T  # (N, M)
-    dist_sq = dist_sq.clamp(min=0)  # Numerical stability
+    targets = torch.cat([gen, pos], dim=0)
+    G = gen.shape[0]
+    D = gen.shape[1]
 
-    if squared:
-        return dist_sq
-    return dist_sq.sqrt()
+    dist = torch.cdist(gen, targets)
+    # Normalize distance by sqrt(D) for high-dimensional stability
+    if normalize_dist and D > 10:
+        dist = dist / (D ** 0.5)
+    dist[:, :G].fill_diagonal_(1e6)  # mask self
+    kernel = (-dist / temp).exp()  # unnormalized kernel
+
+    # Normalize along both dimensions
+    normalizer = kernel.sum(dim=-1, keepdim=True) * kernel.sum(dim=-2, keepdim=True)
+    normalizer = normalizer.clamp_min(1e-12).sqrt()
+    normalized_kernel = kernel / normalizer
+
+    # Cross-weighting
+    pos_coeff = normalized_kernel[:, G:] * normalized_kernel[:, :G].sum(dim=-1, keepdim=True)
+    pos_V = pos_coeff @ targets[G:]
+    neg_coeff = normalized_kernel[:, :G] * normalized_kernel[:, G:].sum(dim=-1, keepdim=True)
+    neg_V = neg_coeff @ targets[:G]
+
+    return pos_V - neg_V
 
 
-def compute_kernel(
-    distances: torch.Tensor,
-    temperature: float,
+def drifting_loss(
+    gen: torch.Tensor,
+    pos: torch.Tensor,
+    temp: float = 0.05,
 ) -> torch.Tensor:
-    """Compute the kernel values from distances.
+    """Drifting loss: MSE(gen, stopgrad(gen + V))."""
+    with torch.no_grad():
+        V = compute_drift(gen, pos, temp)
+        target = (gen + V).detach()
+    return F.mse_loss(gen, target)
 
-    k(x, y) = exp(-||x - y|| / tau)
+
+def compute_drift_multi_temp(
+    gen: torch.Tensor,
+    pos: torch.Tensor,
+    temperatures: List[float] = [0.02, 0.05, 0.2],
+    normalize_each: bool = True,
+) -> torch.Tensor:
+    """
+    Compute drifting field with multiple temperatures.
+
+    Each V is normalized before summing for balanced contribution.
 
     Args:
-        distances: Pairwise distances (N, M)
-        temperature: Temperature parameter tau
+        gen: Generated samples [G, D]
+        pos: Data samples [P, D]
+        temperatures: List of temperature values
+        normalize_each: Whether to normalize each V before summing
 
     Returns:
-        Kernel values (N, M)
+        V: Combined drift vectors [G, D]
     """
-    return torch.exp(-distances / temperature)
+    V_total = torch.zeros_like(gen)
+
+    for tau in temperatures:
+        V_tau = compute_drift(gen, pos, tau)
+
+        if normalize_each:
+            # Normalize so E[||V||^2] ~ 1
+            V_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
+            V_tau = V_tau / (V_norm + 1e-8)
+
+        V_total = V_total + V_tau
+
+    return V_total
 
 
 class DriftingField(nn.Module):
     """Compute the drifting field for generated samples.
 
-    The drifting field governs the movement of samples during training,
-    attracting them toward the data distribution and repelling them from
-    the current generated distribution.
+    Official implementation matching the Colab notebook.
     """
 
     def __init__(
         self,
-        temperatures: List[float] = [0.02, 0.05, 0.2],
-        normalize_drift: bool = True,
-        eps: float = 1e-6,
+        temperature: float = 0.05,
+        temperatures: Optional[List[float]] = None,
+        use_multi_temp: bool = False,
     ):
         super().__init__()
-        self.temperatures = temperatures
-        self.normalize_drift = normalize_drift
-        self.eps = eps
-
-        # Running statistics for drift normalization (Eq. 25)
-        # lambda_j = sqrt(E[(1/C_j) * ||V_j||^2])
-        self.register_buffer(
-            "drift_scales", torch.ones(len(temperatures))
-        )
-        self.register_buffer("num_updates", torch.tensor(0))
-
-    def compute_attraction(
-        self,
-        gen_features: torch.Tensor,
-        pos_features: torch.Tensor,
-        temperature: float,
-    ) -> torch.Tensor:
-        """Compute attraction toward positive (data) samples.
-
-        V^+_p(x) = (1/Z_p) * E_p[k(x, y^+) * (y^+ - x)]
-
-        Args:
-            gen_features: Generated sample features (N_gen, D)
-            pos_features: Positive sample features (N_pos, D)
-            temperature: Kernel temperature
-
-        Returns:
-            Attraction vectors (N_gen, D)
-        """
-        # Compute distances
-        distances = compute_pairwise_distances(gen_features, pos_features)
-
-        # Compute kernel weights
-        kernel = compute_kernel(distances, temperature)
-
-        # Normalize (softmax over positive samples)
-        weights = F.softmax(-distances / temperature, dim=1)  # (N_gen, N_pos)
-
-        # Compute weighted difference
-        # V^+ = sum_j w_j * (y^+_j - x)
-        diff = pos_features.unsqueeze(0) - gen_features.unsqueeze(1)  # (N_gen, N_pos, D)
-        attraction = (weights.unsqueeze(-1) * diff).sum(dim=1)  # (N_gen, D)
-
-        return attraction
-
-    def compute_repulsion(
-        self,
-        gen_features: torch.Tensor,
-        temperature: float,
-        exclude_self: bool = True,
-    ) -> torch.Tensor:
-        """Compute repulsion from other generated samples.
-
-        V^-_q(x) = (1/Z_q) * E_q[k(x, y^-) * (y^- - x)]
-
-        Args:
-            gen_features: Generated sample features (N_gen, D)
-            temperature: Kernel temperature
-            exclude_self: Whether to exclude self-pairs
-
-        Returns:
-            Repulsion vectors (N_gen, D)
-        """
-        N = gen_features.shape[0]
-
-        # Compute self-distances
-        distances = compute_pairwise_distances(gen_features, gen_features)
-
-        # Exclude self-pairs by setting diagonal to large value
-        if exclude_self:
-            mask = torch.eye(N, device=distances.device, dtype=torch.bool)
-            distances = distances.masked_fill(mask, float("inf"))
-
-        # Normalize (softmax over negative samples)
-        weights = F.softmax(-distances / temperature, dim=1)  # (N, N)
-
-        # Compute weighted difference
-        diff = gen_features.unsqueeze(0) - gen_features.unsqueeze(1)  # (N, N, D)
-        repulsion = (weights.unsqueeze(-1) * diff).sum(dim=1)  # (N, D)
-
-        return repulsion
+        self.temperature = temperature
+        self.temperatures = temperatures or [0.02, 0.05, 0.2]
+        self.use_multi_temp = use_multi_temp
 
     def forward(
         self,
         gen_features: torch.Tensor,
         pos_features: torch.Tensor,
-        neg_features: Optional[torch.Tensor] = None,
-        temperature_idx: Optional[int] = None,
-        update_stats: bool = False,
     ) -> torch.Tensor:
         """Compute the drifting field.
-
-        V_{p,q}(x) = V^+_p(x) - V^-_q(x)
 
         Args:
             gen_features: Generated sample features (N_gen, D)
             pos_features: Positive sample features (N_pos, D)
-            neg_features: Negative sample features for repulsion, if None uses gen_features
-            temperature_idx: If provided, use single temperature, else average all
-            update_stats: Whether to update normalization statistics
 
         Returns:
             Drifting field vectors (N_gen, D)
         """
-        if neg_features is None:
-            neg_features = gen_features
-
-        if temperature_idx is not None:
-            temperatures = [self.temperatures[temperature_idx]]
-            drift_scale_indices = [temperature_idx]
-        else:
-            temperatures = self.temperatures
-            drift_scale_indices = list(range(len(temperatures)))
-
-        # Compute drift for each temperature
-        drifts = []
-        for i, (temp, scale_idx) in enumerate(zip(temperatures, drift_scale_indices)):
-            # Attraction to positive samples
-            attraction = self.compute_attraction(gen_features, pos_features, temp)
-
-            # Repulsion from negative samples
-            repulsion = self.compute_repulsion(neg_features, temp)
-
-            # Combined drift
-            drift = attraction - repulsion
-
-            # Normalize drift magnitude (Eq. 25)
-            if self.normalize_drift:
-                if update_stats and self.training:
-                    with torch.no_grad():
-                        D = gen_features.shape[-1]
-                        drift_norm = (drift.norm(dim=-1).mean() / (D**0.5))
-                        momentum = 0.01
-                        self.drift_scales[scale_idx] = (
-                            1 - momentum
-                        ) * self.drift_scales[scale_idx] + momentum * drift_norm
-                        self.num_updates += 1
-
-                scale = self.drift_scales[scale_idx].clamp(min=self.eps)
-                drift = drift / scale
-
-            drifts.append(drift)
-
-        # Average over temperatures
-        drift = torch.stack(drifts, dim=0).mean(dim=0)
-
-        return drift
-
-
-class MultiScaleDriftingField(nn.Module):
-    """Compute drifting field in multi-scale feature space.
-
-    This computes the drifting field at multiple feature scales and
-    combines them for a more robust gradient signal.
-    """
-
-    def __init__(
-        self,
-        feature_names: List[str],
-        temperatures: List[float] = [0.02, 0.05, 0.2],
-        normalize_drift: bool = True,
-    ):
-        super().__init__()
-        self.feature_names = feature_names
-        self.temperatures = temperatures
-
-        # Create drifting field for each feature scale
-        self.drift_fields = nn.ModuleDict({
-            name: DriftingField(temperatures, normalize_drift)
-            for name in feature_names
-        })
-
-        # Learnable weights for combining scales
-        self.scale_weights = nn.Parameter(torch.ones(len(feature_names)))
-
-    def forward(
-        self,
-        gen_features: Dict[str, torch.Tensor],
-        pos_features: Dict[str, torch.Tensor],
-        neg_features: Optional[Dict[str, torch.Tensor]] = None,
-        update_stats: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        """Compute drifting field at each feature scale.
-
-        Args:
-            gen_features: Dict of generated sample features
-            pos_features: Dict of positive sample features
-            neg_features: Dict of negative sample features (optional)
-            update_stats: Whether to update normalization statistics
-
-        Returns:
-            Dict of drifting field vectors at each scale
-        """
-        if neg_features is None:
-            neg_features = gen_features
-
-        drifts = {}
-        weights = F.softmax(self.scale_weights, dim=0)
-
-        for i, name in enumerate(self.feature_names):
-            if name not in gen_features:
-                continue
-
-            gen_feat = gen_features[name]
-            pos_feat = pos_features[name]
-            neg_feat = neg_features.get(name, gen_feat)
-
-            # Flatten spatial dimensions if needed
-            if gen_feat.dim() == 3:
-                B, C, N = gen_feat.shape
-                gen_feat = gen_feat.permute(0, 2, 1).reshape(-1, C)  # (B*N, C)
-                pos_feat = pos_feat.permute(0, 2, 1).reshape(-1, C)
-                neg_feat = neg_feat.permute(0, 2, 1).reshape(-1, C)
-
-            drift = self.drift_fields[name](
-                gen_feat, pos_feat, neg_feat, update_stats=update_stats
+        if self.use_multi_temp:
+            return compute_drift_multi_temp(
+                gen_features, pos_features, self.temperatures
             )
-
-            # Reshape back if needed
-            if gen_features[name].dim() == 3:
-                B = gen_features[name].shape[0]
-                drift = drift.reshape(B, N, C).permute(0, 2, 1)
-
-            drifts[name] = drift * weights[i]
-
-        return drifts
+        else:
+            return compute_drift(gen_features, pos_features, self.temperature)
 
 
 class DriftingLoss(nn.Module):
     """Compute the drifting loss for training.
 
     L = E[||f_theta(epsilon) - stopgrad(f_theta(epsilon) + V)||^2]
-
-    The loss minimizes the squared drift norm by moving generated samples
-    toward targets that incorporate the drifting field.
     """
 
     def __init__(
         self,
-        feature_encoder: nn.Module,
-        temperatures: List[float] = [0.02, 0.05, 0.2],
-        normalize_drift: bool = True,
-        loss_type: str = "mse",
+        feature_encoder: Optional[nn.Module] = None,
+        temperature: float = 0.05,
+        temperatures: Optional[List[float]] = None,
+        use_multi_temp: bool = False,
+        flatten_features: bool = True,
     ):
         super().__init__()
         self.feature_encoder = feature_encoder
-        self.temperatures = temperatures
-        self.loss_type = loss_type
+        self.temperature = temperature
+        self.temperatures = temperatures or [0.02, 0.05, 0.2]
+        self.use_multi_temp = use_multi_temp
+        self.flatten_features = flatten_features
 
-        # Get feature names from encoder
-        feature_names = self.feature_encoder.get_feature_names()
+    def get_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract features from samples."""
+        if self.feature_encoder is not None:
+            feat = self.feature_encoder(x)
+            if isinstance(feat, dict):
+                # Use the last feature layer if dict is returned
+                feat = list(feat.values())[-1]
+        else:
+            feat = x
 
-        # Multi-scale drifting field
-        self.drift_field = MultiScaleDriftingField(
-            feature_names, temperatures, normalize_drift
-        )
+        if self.flatten_features and feat.dim() > 2:
+            feat = feat.flatten(start_dim=1)
+
+        return feat
 
     def forward(
         self,
         generated: torch.Tensor,
         positive: torch.Tensor,
-        negative: Optional[torch.Tensor] = None,
-        update_stats: bool = True,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute the drifting loss.
 
         Args:
-            generated: Generated samples (B, C, H, W)
-            positive: Positive (real) samples (B_pos, C, H, W)
-            negative: Negative samples for repulsion (optional)
-            update_stats: Whether to update normalization statistics
+            generated: Generated samples (B, ...)
+            positive: Positive (real) samples (B_pos, ...)
 
         Returns:
             Tuple of (loss, metrics_dict)
         """
         # Extract features
-        gen_features = self.feature_encoder(generated, update_stats=update_stats)
-        pos_features = self.feature_encoder(positive, update_stats=False)
+        gen_feat = self.get_features(generated)
+        pos_feat = self.get_features(positive)
 
-        if negative is not None:
-            neg_features = self.feature_encoder(negative, update_stats=False)
+        # Compute drifting field
+        if self.use_multi_temp:
+            V = compute_drift_multi_temp(gen_feat, pos_feat, self.temperatures)
         else:
-            neg_features = gen_features
+            V = compute_drift(gen_feat, pos_feat, self.temperature)
 
-        # Compute drifting field at each scale
-        drifts = self.drift_field(
-            gen_features, pos_features, neg_features, update_stats=update_stats
-        )
+        # Target is generated feature + drift (with stop gradient)
+        target = (gen_feat + V).detach()
 
-        # Compute loss at each scale
-        total_loss = 0.0
-        metrics = {}
+        # MSE loss
+        loss = F.mse_loss(gen_feat, target)
 
-        for name in drifts:
-            gen_feat = gen_features[name]
-            drift = drifts[name]
+        # Metrics
+        metrics = {
+            "loss": loss.item(),
+            "drift_norm": V.norm(dim=-1).mean().item(),
+        }
 
-            # Target is generated feature + drift (with stop gradient)
-            target = (gen_feat + drift).detach()
-
-            # MSE loss
-            if self.loss_type == "mse":
-                loss = F.mse_loss(gen_feat, target)
-            elif self.loss_type == "l1":
-                loss = F.l1_loss(gen_feat, target)
-            elif self.loss_type == "huber":
-                loss = F.smooth_l1_loss(gen_feat, target)
-            else:
-                raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-            total_loss = total_loss + loss
-            metrics[f"loss_{name}"] = loss.item()
-
-            # Also track drift magnitude
-            metrics[f"drift_norm_{name}"] = drift.norm(dim=-1).mean().item()
-
-        metrics["total_loss"] = total_loss.item()
-
-        return total_loss, metrics
+        return loss, metrics
 
 
-class SimpleDriftingLoss(nn.Module):
-    """Simplified drifting loss operating directly in pixel/latent space.
+class ClassConditionalDriftingLoss(nn.Module):
+    """Class-conditional drifting loss.
 
-    This is useful for toy examples or when feature extraction is not needed.
+    For class-conditional generation, computes drifting loss per class.
     """
 
     def __init__(
         self,
-        temperature: float = 0.1,
+        feature_encoder: Optional[nn.Module] = None,
+        temperature: float = 0.05,
+        num_classes: int = 1000,
     ):
         super().__init__()
+        self.feature_encoder = feature_encoder
         self.temperature = temperature
+        self.num_classes = num_classes
+
+    def get_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract features from samples."""
+        if self.feature_encoder is not None:
+            feat = self.feature_encoder(x)
+            if isinstance(feat, dict):
+                feat = list(feat.values())[-1]
+        else:
+            feat = x
+
+        if feat.dim() > 2:
+            feat = feat.flatten(start_dim=1)
+
+        return feat
 
     def forward(
         self,
         generated: torch.Tensor,
+        labels_gen: torch.Tensor,
         positive: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute simple drifting loss.
+        labels_pos: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute class-conditional drifting loss.
 
         Args:
-            generated: Generated samples (B, D) or (B, C, H, W)
-            positive: Positive samples (B_pos, D) or (B_pos, C, H, W)
+            generated: Generated samples (N, ...)
+            labels_gen: Labels for generated samples (N,)
+            positive: Positive samples (N_pos, ...)
+            labels_pos: Labels for positive samples (N_pos,)
 
         Returns:
             Tuple of (loss, metrics_dict)
         """
-        # Flatten if needed
-        gen_flat = generated.flatten(1)  # (B, D)
-        pos_flat = positive.flatten(1)  # (B_pos, D)
+        device = generated.device
 
-        # Compute attraction
-        dist_pos = compute_pairwise_distances(gen_flat, pos_flat)
-        weights_pos = F.softmax(-dist_pos / self.temperature, dim=1)
-        diff_pos = pos_flat.unsqueeze(0) - gen_flat.unsqueeze(1)
-        attraction = (weights_pos.unsqueeze(-1) * diff_pos).sum(dim=1)
+        # Extract features
+        gen_feat = self.get_features(generated)
+        pos_feat = self.get_features(positive)
 
-        # Compute repulsion
-        dist_neg = compute_pairwise_distances(gen_flat, gen_flat)
-        mask = torch.eye(gen_flat.shape[0], device=dist_neg.device, dtype=torch.bool)
-        dist_neg = dist_neg.masked_fill(mask, float("inf"))
-        weights_neg = F.softmax(-dist_neg / self.temperature, dim=1)
-        diff_neg = gen_flat.unsqueeze(0) - gen_flat.unsqueeze(1)
-        repulsion = (weights_neg.unsqueeze(-1) * diff_neg).sum(dim=1)
+        total_loss = 0.0
+        total_drift_norm = 0.0
+        count = 0
 
-        # Drifting field
-        drift = attraction - repulsion
+        # Compute loss per class
+        unique_labels = labels_gen.unique()
+        for c in unique_labels:
+            mask_gen = labels_gen == c
+            mask_pos = labels_pos == c
 
-        # Target and loss
-        target = (gen_flat + drift).detach()
-        loss = F.mse_loss(gen_flat, target)
+            if not mask_gen.any() or not mask_pos.any():
+                continue
+
+            gen_c = gen_feat[mask_gen]
+            pos_c = pos_feat[mask_pos]
+
+            # Compute drift
+            V = compute_drift(gen_c, pos_c, self.temperature)
+
+            # Loss
+            target = (gen_c + V).detach()
+            loss_c = F.mse_loss(gen_c, target)
+
+            n_c = len(gen_c)
+            total_loss = total_loss + loss_c * n_c
+            total_drift_norm = total_drift_norm + V.norm(dim=-1).mean().item() * n_c
+            count += n_c
+
+        if count == 0:
+            return torch.tensor(0.0, device=device), {"loss": 0.0, "drift_norm": 0.0}
+
+        loss = total_loss / count
 
         metrics = {
             "loss": loss.item(),
-            "drift_norm": drift.norm(dim=-1).mean().item(),
-            "attraction_norm": attraction.norm(dim=-1).mean().item(),
-            "repulsion_norm": repulsion.norm(dim=-1).mean().item(),
+            "drift_norm": total_drift_norm / count,
         }
 
         return loss, metrics
+
+
+# Convenience function for toy 2D experiments
+def drift_step_2d(
+    points: torch.Tensor,
+    target_dist: torch.Tensor,
+    temperature: float = 0.05,
+    step_size: float = 0.1,
+) -> torch.Tensor:
+    """Single drift step for 2D toy experiments.
+
+    Args:
+        points: Current points (N, 2)
+        target_dist: Target distribution samples (M, 2)
+        temperature: Temperature for V computation
+        step_size: Step size for drift
+
+    Returns:
+        Updated points after one drift step
+    """
+    V = compute_drift(points, target_dist, temperature)
+    return points + step_size * V
+
+
+# Legacy aliases for backward compatibility
+SimpleDriftingLoss = DriftingLoss

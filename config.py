@@ -52,7 +52,11 @@ class EncoderConfig:
 @dataclass
 class DriftingConfig:
     """Configuration for the drifting field computation."""
-    # Kernel temperatures
+    # Kernel temperature (official: 0.05)
+    temperature: float = 0.05
+
+    # Multi-temperature option (default: False for official behavior)
+    use_multi_temp: bool = False
     temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
 
     # Sample counts
@@ -65,10 +69,6 @@ class DriftingConfig:
     cfg_alpha_min: float = 1.0
     cfg_alpha_max: float = 4.0
     cfg_power: float = 3.0  # For sampling p(alpha) ~ alpha^(-power)
-
-    # Feature normalization
-    normalize_features: bool = True
-    normalize_drift: bool = True
 
 
 @dataclass

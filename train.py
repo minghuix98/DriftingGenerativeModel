@@ -119,11 +119,11 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
 
-        # Loss
+        # Loss (using official implementation)
         self.drift_loss = DriftingLoss(
             feature_encoder=self.feature_encoder,
-            temperatures=config.drifting.temperatures,
-            normalize_drift=config.drifting.normalize_drift,
+            temperature=config.drifting.temperature if hasattr(config.drifting, 'temperature') else 0.05,
+            use_multi_temp=config.drifting.use_multi_temp if hasattr(config.drifting, 'use_multi_temp') else False,
         ).to(self.device)
 
         # CFG-aware loss wrapper
